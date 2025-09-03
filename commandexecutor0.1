@@ -1,0 +1,229 @@
+from flask import Flask, request, jsonify, render_template_string, Response
+from pyVim.connect import SmartConnectNoSSL, Disconnect
+from pyVmomi import vim
+import atexit
+import requests
+import time
+
+app = Flask(__name__)
+
+# vSphere connection details
+VSPHERE_HOST = "your-vcenter-host"
+VSPHERE_USER = "administrator@vsphere.local"
+VSPHERE_PASSWORD = "yourpassword"
+
+# Connect to vSphere and return ServiceInstance and GuestOperationsManager
+def connect_vsphere():
+    si = SmartConnectNoSSL(host=VSPHERE_HOST, user=VSPHERE_USER, pwd=VSPHERE_PASSWORD, port=443)
+    atexit.register(Disconnect, si)
+    content = si.RetrieveContent()
+    gom = content.guestOperationsManager
+    return si, gom
+
+# Retrieve all VMs
+def list_all_vms(si):
+    content = si.RetrieveContent()
+    container = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
+    vms = []
+    for vm in container.view:
+        ip = vm.guest.ipAddress if vm.guest.ipAddress else "N/A"
+        vms.append({"name": vm.name, "ip": ip, "power_state": vm.runtime.powerState})
+    return vms
+
+# Find VM by name or IP
+def find_vm(si, search_term):
+    content = si.RetrieveContent()
+    container = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
+    for vm in container.view:
+        if vm.name == search_term:
+            return vm
+        try:
+            for nic in vm.guest.net:
+                if nic.ipConfig:
+                    for ip in nic.ipConfig.ipAddress:
+                        if ip.ipAddress == search_term:
+                            return vm
+        except:
+            continue
+    return None
+
+# Run command once finished
+def run_command(vm, gom, username, password, command):
+    try:
+        guest_auth = vim.vm.guest.NamePasswordAuthentication(username=username, password=password)
+        process_mgr = gom.processManager
+        file_mgr = gom.fileManager
+
+        out_file = "/tmp/vm_cmd_out.txt"
+        rc_file = "/tmp/vm_cmd_rc.txt"
+        wrapped_command = f"/bin/bash -c \"{command} > {out_file} 2>&1; echo $? > {rc_file}\""
+
+        spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath="/bin/bash", arguments=f"-c '{wrapped_command}'")
+        pid = process_mgr.StartProgramInGuest(vm=vm, auth=guest_auth, spec=spec)
+
+        while True:
+            procs = process_mgr.ListProcessesInGuest(vm, guest_auth, [pid])
+            if procs and procs[0].endTime is not None:
+                break
+            time.sleep(1)
+
+        out_url = file_mgr.InitiateFileTransferFromGuest(vm, guest_auth, out_file)
+        rc_url = file_mgr.InitiateFileTransferFromGuest(vm, guest_auth, rc_file)
+        out_text = requests.get(out_url.url, verify=False).text
+        rc_text = requests.get(rc_url.url, verify=False).text.strip()
+
+        return {"pid": pid, "output": out_text, "exit_code": rc_text}
+    except Exception as e:
+        return {"error": str(e)}
+
+# Stream command output
+def stream_command(vm, gom, username, password, command):
+    guest_auth = vim.vm.guest.NamePasswordAuthentication(username=username, password=password)
+    process_mgr = gom.processManager
+    file_mgr = gom.fileManager
+
+    out_file = "/tmp/vm_cmd_out.txt"
+    rc_file = "/tmp/vm_cmd_rc.txt"
+    wrapped_command = f"/bin/bash -c \"{command} > {out_file} 2>&1; echo $? > {rc_file}\""
+
+    spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath="/bin/bash", arguments=f"-c '{wrapped_command}'")
+    pid = process_mgr.StartProgramInGuest(vm=vm, auth=guest_auth, spec=spec)
+
+    def generate():
+        last_output = ""
+        while True:
+            procs = process_mgr.ListProcessesInGuest(vm, guest_auth, [pid])
+            if procs and procs[0].endTime is not None:
+                out_url = file_mgr.InitiateFileTransferFromGuest(vm, guest_auth, out_file)
+                rc_url = file_mgr.InitiateFileTransferFromGuest(vm, guest_auth, rc_file)
+                out_text = requests.get(out_url.url, verify=False).text
+                rc_text = requests.get(rc_url.url, verify=False).text.strip()
+                yield f"data: {out_text}\n\n"
+                yield f"data: [Process exited with code {rc_text}]\n\n"
+                break
+            try:
+                out_url = file_mgr.InitiateFileTransferFromGuest(vm, guest_auth, out_file)
+                out_text = requests.get(out_url.url, verify=False).text
+                if out_text != last_output:
+                    new_data = out_text[len(last_output):]
+                    yield f"data: {new_data}\n\n"
+                    last_output = out_text
+            except:
+                pass
+            time.sleep(1)
+    return Response(generate(), mimetype='text/event-stream')
+
+# Home page with VM list and command input
+@app.route('/', methods=['GET'])
+def index():
+    si, _ = connect_vsphere()
+    vms = list_all_vms(si)
+    return render_template_string('''
+    <!doctype html>
+    <html>
+    <head>
+        <title>vSphere VM Executor</title>
+        <style>
+            body { font-family: Arial; margin: 20px; }
+            table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+            th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+            th { background: #f2f2f2; }
+            input, button { padding: 8px; margin: 5px; }
+            pre { background: #f4f4f4; padding: 10px; border-radius: 5px; height: 300px; overflow: auto; }
+        </style>
+    </head>
+    <body>
+        <h1>vSphere VM Executor</h1>
+        <input type="text" id="search" placeholder="Search VM..." onkeyup="filterVMs()">
+        <table id="vmTable">
+            <thead><tr><th>Name</th><th>IP</th><th>Power State</th></tr></thead>
+            <tbody>
+                {% for vm in vms %}
+                <tr onclick="selectVM('{{ vm.name }}')"><td>{{ vm.name }}</td><td>{{ vm.ip }}</td><td>{{ vm.power_state }}</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <h2>Command Execution</h2>
+        <label>Selected VM:</label><input type="text" id="vm_name"><br>
+        <label>Guest Username:</label><input type="text" id="username"><br>
+        <label>Guest Password:</label><input type="password" id="password"><br>
+        <label>Command:</label><input type="text" id="command"><br>
+        <button onclick="runCommand()">Run Command</button>
+        <button onclick="runStream()">Run Live Stream</button>
+
+        <h3>Output:</h3>
+        <pre id="output"></pre>
+
+        <script>
+            function filterVMs(){
+                var input = document.getElementById('search').value.toLowerCase();
+                var rows = document.getElementById('vmTable').getElementsByTagName('tr');
+                for(var i=1; i<rows.length; i++){
+                    var name = rows[i].cells[0].innerText.toLowerCase();
+                    var ip = rows[i].cells[1].innerText.toLowerCase();
+                    rows[i].style.display = (name.includes(input) || ip.includes(input)) ? '' : 'none';
+                }
+            }
+            function selectVM(name){
+                document.getElementById('vm_name').value = name;
+            }
+            function runCommand(){
+                var vm = document.getElementById('vm_name').value;
+                var user = document.getElementById('username').value;
+                var pass = document.getElementById('password').value;
+                var cmd = document.getElementById('command').value;
+                fetch('/execute', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({search_term:vm, username:user, password:pass, command:cmd})
+                }).then(r=>r.json()).then(data=>{
+                    document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+                });
+            }
+            function runStream(){
+                var vm = document.getElementById('vm_name').value;
+                var user = document.getElementById('username').value;
+                var pass = document.getElementById('password').value;
+                var cmd = document.getElementById('command').value;
+                var output = document.getElementById('output');
+                output.textContent = '';
+                var evt = new EventSource(`/stream?search_term=${encodeURIComponent(vm)}&username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}&command=${encodeURIComponent(cmd)}`);
+                evt.onmessage = function(e){ output.textContent += e.data + '\n'; };
+            }
+        </script>
+    </body>
+    </html>
+    ''', vms=vms)
+
+@app.route('/execute', methods=['POST'])
+def execute():
+    data = request.json
+    search_term = data.get("search_term")
+    username = data.get("username")
+    password = data.get("password")
+    command = data.get("command")
+    if not all([search_term, username, password, command]):
+        return jsonify({"error":"Missing parameters"}),400
+    si, gom = connect_vsphere()
+    vm = find_vm(si, search_term)
+    if not vm:
+        return jsonify({"error":"VM not found"}),404
+    result = run_command(vm, gom, username, password, command)
+    return jsonify(result)
+
+@app.route('/stream')
+def stream():
+    search_term = request.args.get("search_term")
+    username = request.args.get("username")
+    password = request.args.get("password")
+    command = request.args.get("command")
+    if not all([search_term, username, password, command]):
+        return Response("Missing parameters", status=400)
+    si, gom = connect_vsphere()
+    vm = find_vm(si, search_term)
+    if not vm:
+        return Response("VM not found", status=404)
+    return stream_command(vm, gom, username, password, command)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
