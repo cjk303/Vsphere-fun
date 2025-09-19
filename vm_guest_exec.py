@@ -128,21 +128,20 @@ def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: s
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
     gom = si.content.guestOperationsManager
     pm = gom.processManager
-    fm = gom.fileManager
 
     # Determine guest OS and wrap command
     guest_os = vm.summary.config.guestFullName.lower()
     is_windows = "windows" in guest_os
 
+    # Generate temp file BEFORE creating command
+    temp_file = f"/tmp/guest_out_{uuid.uuid4().hex}.txt" if not is_windows else f"C:\\Windows\\Temp\\guest_out_{uuid.uuid4().hex}.txt"
+
     if is_windows:
         program_path = "C:\\Windows\\System32\\cmd.exe"
-        final_args = f"/c {command} {args}".strip()
-        temp_file = f"C:\\Windows\\Temp\\guest_out_{uuid.uuid4().hex}.txt"
-        final_args += f" > {temp_file} 2>&1"
+        final_args = f"/c {command} {args} > {temp_file} 2>&1"
     else:
         program_path = "/bin/bash"
-        final_args = f"-c \"{command} {args} > /tmp/guest_out_{uuid.uuid4().hex}.txt 2>&1\""
-        temp_file = f"/tmp/{final_args.split('>')[1].split()[0]}"
+        final_args = f"-c \"{command} {args} > {temp_file} 2>&1\""
 
     spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath=program_path, arguments=final_args)
     pid = pm.StartProgramInGuest(vm=vm, auth=creds, spec=spec)
