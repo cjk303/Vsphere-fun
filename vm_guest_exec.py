@@ -130,18 +130,24 @@ def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: s
     pm = gom.processManager
     fm = gom.fileManager
 
-    # Temp file for stdout/stderr
-    if "\\" in command:
-        temp_file = f"C:\\Windows\\Temp\\guest_out_{uuid.uuid4().hex}.txt"
-        redirect_args = f"{args} > {temp_file} 2>&1"
-    else:
-        temp_file = f"/tmp/guest_out_{uuid.uuid4().hex}.txt"
-        redirect_args = f"{args} > {temp_file} 2>&1"
+    # Determine guest OS and wrap command
+    guest_os = vm.summary.config.guestFullName.lower()
+    is_windows = "windows" in guest_os
 
-    spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath=command, arguments=redirect_args)
+    if is_windows:
+        program_path = "C:\\Windows\\System32\\cmd.exe"
+        final_args = f"/c {command} {args}".strip()
+        temp_file = f"C:\\Windows\\Temp\\guest_out_{uuid.uuid4().hex}.txt"
+        final_args += f" > {temp_file} 2>&1"
+    else:
+        program_path = "/bin/bash"
+        final_args = f"-c \"{command} {args} > /tmp/guest_out_{uuid.uuid4().hex}.txt 2>&1\""
+        temp_file = f"/tmp/{final_args.split('>')[1].split()[0]}"
+
+    spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath=program_path, arguments=final_args)
     pid = pm.StartProgramInGuest(vm=vm, auth=creds, spec=spec)
     print(f"[INFO] Started process in VM {vm.summary.config.name}, PID={pid}")
-    return pid, temp_file, gom
+    return pid, temp_file, gom, is_windows
 
 def wait_for_process(vm: vim.VirtualMachine, pid: int, gom, guest_user: str, guest_pass: str, timeout=60):
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
@@ -154,7 +160,7 @@ def wait_for_process(vm: vim.VirtualMachine, pid: int, gom, guest_user: str, gue
         time.sleep(1)
     return False
 
-def read_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_pass: str, file_path: str):
+def read_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_pass: str, file_path: str, is_windows: bool):
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
     fm = gom.fileManager
     try:
@@ -179,9 +185,9 @@ def execute_guest_command(vcenters, target, guest_user, guest_pass, command, arg
     vm, vc, si = find_vm_by_cache_or_live(vcenters, target, cache, skip_cache)
     if not vm:
         return False, f"VM {target} not found"
-    pid, temp_file, gom = run_command_in_vm(si, vm, guest_user, guest_pass, command, args)
+    pid, temp_file, gom, is_windows = run_command_in_vm(si, vm, guest_user, guest_pass, command, args)
     success = wait_for_process(vm, pid, gom, guest_user, guest_pass, timeout)
-    output = read_file_from_guest(vm, gom, guest_user, guest_pass, temp_file)
+    output = read_file_from_guest(vm, gom, guest_user, guest_pass, temp_file, is_windows)
     delete_file_from_guest(vm, gom, guest_user, guest_pass, temp_file)
     Disconnect(si)
     return success, output
@@ -189,7 +195,7 @@ def execute_guest_command(vcenters, target, guest_user, guest_pass, command, arg
 # ---------- CLI ----------
 def main():
     parser = argparse.ArgumentParser(
-        description="Execute commands in VMs using VMware Tools with cache support",
+        description="Execute shell commands in VMs using VMware Tools with cache support",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--cred-file", default="vm_cred.enc", help="Encrypted vCenter credentials file")
@@ -200,8 +206,8 @@ def main():
     parser.add_argument("--vm", required=True, help="VM name or IP")
     parser.add_argument("--guest-user", required=True, help="Guest OS username")
     parser.add_argument("--guest-pass", required=True, help="Guest OS password")
-    parser.add_argument("--command", required=True, help="Command or program to run inside guest VM")
-    parser.add_argument("--args", default="", help="Command arguments")
+    parser.add_argument("--command", required=True, help="Shell command to run inside guest VM")
+    parser.add_argument("--args", default="", help="Optional command arguments")
     parser.add_argument("--timeout", type=int, default=60, help="Timeout in seconds")
     args = parser.parse_args()
 
