@@ -2,20 +2,23 @@ import os
 import shlex
 import threading
 import subprocess
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
 socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 
+
 @app.route("/")
 def index():
     return render_template("index.html")
 
+
 def run_snapshot(host, snapshot_name, snapshot_desc, sid):
-    """Run vm_snapshot.py and emit progress to frontend."""
-    # Full path to vm_snapshot.py
+    """
+    Run vm_snapshot.py and emit progress if sid is provided.
+    """
     script_path = os.path.join(os.path.dirname(__file__), "vm_snapshot.py")
     cmd = [
         "python",
@@ -26,8 +29,7 @@ def run_snapshot(host, snapshot_name, snapshot_desc, sid):
         "--verbose"
     ]
 
-    # Debug
-    print("[DEBUG] Running command:", " ".join(shlex.quote(arg) for arg in cmd))
+    print(f"[DEBUG] Running snapshot for {host}: {' '.join(cmd)}")
 
     try:
         process = subprocess.Popen(
@@ -37,11 +39,15 @@ def run_snapshot(host, snapshot_name, snapshot_desc, sid):
             universal_newlines=True
         )
 
+        found_vm = False
+        snapshot_created = False
+
         for line in iter(process.stdout.readline, ''):
             if not line:
                 continue
             line = line.strip()
             msg_lower = line.lower()
+
             progress = 0
             if "connect" in msg_lower:
                 progress = 10
@@ -49,38 +55,49 @@ def run_snapshot(host, snapshot_name, snapshot_desc, sid):
                 progress = 30
             elif "found" in msg_lower or "vm matched" in msg_lower:
                 progress = 50
+                found_vm = True
             elif "creating snapshot" in msg_lower:
                 progress = 70
             elif "snapshot created" in msg_lower or "created successfully" in msg_lower:
                 progress = 90
+                snapshot_created = True
 
-            # Emit progress to frontend using the user-provided host
-            socketio.emit(
-                "snapshot_progress",
-                {"host": host, "message": line, "progress": progress},
-                room=sid
-            )
+            if sid:
+                socketio.emit(
+                    "snapshot_progress",
+                    {"host": host, "message": line, "progress": progress},
+                    room=sid
+                )
+
         process.stdout.close()
         retcode = process.wait()
-        print(f"[DEBUG] vm_snapshot.py finished for {host} with exit code {retcode}")
+        print(f"[DEBUG] Snapshot process finished for {host}, exit code {retcode}")
 
-        # Ensure final 100% progress
-        socketio.emit(
-            "snapshot_progress",
-            {"host": host, "message": "Snapshot complete", "progress": 100},
-            room=sid
-        )
-        socketio.emit("snapshot_complete", {"host": host}, room=sid)
+        success = found_vm and snapshot_created
+
+        if sid:
+            socketio.emit(
+                "snapshot_complete",
+                {"host": host, "success": success},
+                room=sid
+            )
+        else:
+            print(f"[WEBHOOK] Snapshot {'succeeded ✅' if success else 'failed ❌'} for {host}")
 
     except Exception as e:
-        print(f"[ERROR] Exception for host {host}: {e}")
-        socketio.emit(
-            "snapshot_progress",
-            {"host": host, "message": f"Error: {e}", "progress": 100},
-            room=sid
-        )
-        socketio.emit("snapshot_complete", {"host": host}, room=sid)
+        print(f"[ERROR] Exception during snapshot for host {host}: {e}")
+        if sid:
+            socketio.emit(
+                "snapshot_progress",
+                {"host": host, "message": f"Error: {e}", "progress": 100},
+                room=sid
+            )
+            socketio.emit("snapshot_complete", {"host": host, "success": False}, room=sid)
+        else:
+            print(f"[WEBHOOK] Snapshot failed for {host}: {e}")
 
+
+# --- Web UI triggers ---
 @socketio.on("start_snapshots")
 def handle_start_snapshots(data):
     hosts = data.get("hosts", [])
@@ -98,13 +115,40 @@ def handle_start_snapshots(data):
                 daemon=True
             ).start()
 
+
+# --- Webhook endpoint ---
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    if not data or "hosts" not in data:
+        return jsonify({"status": "error", "message": "Invalid payload, 'hosts' required"}), 400
+
+    hosts = [{"name": h, "selected": True} for h in data.get("hosts", [])]
+    snapshot_name = data.get("snapshot_name", "AutoSnapshot")
+    snapshot_desc = data.get("snapshot_desc", "Triggered via webhook")
+
+    for h in hosts:
+        host_name = h["name"]
+        print(f"[WEBHOOK] Triggering snapshot for host: {host_name}")
+        threading.Thread(
+            target=run_snapshot,
+            args=(host_name, snapshot_name, snapshot_desc, None),  # sid=None for webhook
+            daemon=True
+        ).start()
+
+    return jsonify({"status": "success", "message": f"Snapshots triggered for {len(hosts)} host(s)"}), 200
+
+
+# --- SocketIO events ---
 @socketio.on("connect")
 def handle_connect():
-    print("[DEBUG] Client connected:", request.sid)
+    print(f"[DEBUG] Client connected: {request.sid}")
+
 
 @socketio.on("disconnect")
 def handle_disconnect():
-    print("[DEBUG] Client disconnected:", request.sid)
+    print(f"[DEBUG] Client disconnected: {request.sid}")
+
 
 if __name__ == "__main__":
     print("[DEBUG] Starting Flask-SocketIO server...")
