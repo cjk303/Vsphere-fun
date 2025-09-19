@@ -7,6 +7,9 @@
     <!-- Local Bootstrap CSS -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/bootstrap.min.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+
+    <!-- Bootstrap Icons -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
 </head>
 <body>
 <div class="container my-5">
@@ -17,14 +20,16 @@
         <div class="card-body">
             <h5 class="card-title text-epiq-accent">Paste VM Names or IPs</h5>
             <textarea id="hosts_input" class="form-control epiq-input" rows="8" placeholder="One VM per line"></textarea>
-            <button id="parse_hosts_btn" class="btn epiq-btn mt-3">Parse Hosts</button>
+            <button id="parse_hosts_btn" type="button" class="btn btn-primary epiq-btn mt-3">
+                <i class="bi bi-search"></i> Parse Hosts
+            </button>
         </div>
     </div>
 
     <!-- VM Table -->
     <div id="hosts_table_div" class="mb-4"></div>
 
-    <!-- Snapshot Settings (hidden until list is parsed) -->
+    <!-- Snapshot Settings -->
     <div id="snapshot_controls" class="card mb-4 epiq-card" style="display:none;">
         <div class="card-body">
             <div class="row g-3">
@@ -37,7 +42,9 @@
                     <input type="text" id="snapshot_desc" class="form-control epiq-input" value="Created via web UI">
                 </div>
             </div>
-            <button id="snapshot_btn" class="btn epiq-btn mt-3">Start Snapshot</button>
+            <button id="snapshot_btn" type="button" class="btn btn-success epiq-btn mt-3">
+                <i class="bi bi-camera"></i> Start Snapshot
+            </button>
         </div>
     </div>
 
@@ -54,17 +61,23 @@
 let hosts_list = [];
 const socket = io();
 
-// Debug connection
+// Socket debug
 socket.on('connect', () => console.log("[DEBUG] Socket connected:", socket.id));
 socket.on('disconnect', reason => console.warn("[DEBUG] Disconnected:", reason));
 
+// Render VM table
 function renderTable(hosts) {
     let html = '<table class="table table-striped table-hover epiq-table">';
     html += '<thead><tr><th><input type="checkbox" id="select_all" checked></th><th>VM</th><th>Status</th><th>Progress</th></tr></thead><tbody>';
     hosts.forEach((host, index) => {
         html += `<tr>
             <td><input type="checkbox" class="select_host" data-index="${index}" checked></td>
-            <td>${host.name}</td>
+            <td>
+                <span id="icon_${index}" class="spinner-border spinner-border-sm text-warning me-2" role="status" style="display:none;">
+                    <span class="visually-hidden">Loading...</span>
+                </span>
+                ${host.name}
+            </td>
             <td id="status_${index}">Pending</td>
             <td>
                 <div class="progress">
@@ -76,7 +89,7 @@ function renderTable(hosts) {
     html += '</tbody></table>';
     $('#hosts_table_div').html(html);
 
-    // Show snapshot controls once hosts are parsed
+    // Show snapshot controls
     $('#snapshot_controls').show();
 
     // Select all toggle
@@ -108,36 +121,44 @@ $(document).ready(function(){
     // Progress updates
     socket.on('snapshot_progress', function(data){
         console.log("[DEBUG] snapshot_progress:", data);
-        let index = hosts_list.findIndex(
-            h => h.name.trim().toLowerCase() === data.host.trim().toLowerCase()
-        );
+        let index = hosts_list.findIndex(h => h.name.trim().toLowerCase() === data.host.trim().toLowerCase());
         if(index >= 0){
-            $('#status_' + index).text(data.message);
+            let statusCell = $('#status_' + index);
             let bar = $('#progress_' + index);
+
+            statusCell.text(data.message);
+
             if(data.progress > 0){
                 bar.css('width', data.progress + '%')
                    .attr('aria-valuenow', data.progress)
-                   .addClass('bg-epiq-progress');
+                   .removeClass().addClass('progress-bar bg-warning'); // yellow while running
             }
-        } else {
-            console.warn("[DEBUG] Could not match host for progress event:", data.host);
+
+            // Show spinner
+            $('#icon_' + index).show().removeClass().text('').addClass('spinner-border spinner-border-sm text-warning');
         }
     });
 
     // Completion updates
     socket.on('snapshot_complete', function(data){
         console.log("[DEBUG] snapshot_complete:", data);
-        let index = hosts_list.findIndex(
-            h => h.name.trim().toLowerCase() === data.host.trim().toLowerCase()
-        );
+        let index = hosts_list.findIndex(h => h.name.trim().toLowerCase() === data.host.trim().toLowerCase());
         if(index >= 0){
-            $('#status_' + index).text('Completed').removeClass().addClass('text-success');
-            $('#progress_' + index).css('width', '100%')
-                .addClass('bg-success')
-                .attr('aria-valuenow', 100);
+            let statusCell = $('#status_' + index);
+            let bar = $('#progress_' + index);
+            let icon = $('#icon_' + index);
+
+            if(data.success){
+                statusCell.text('Snapshot completed successfully ✅').removeClass().addClass('text-success');
+                bar.css('width','100%').removeClass().addClass('progress-bar bg-success').attr('aria-valuenow',100);
+                icon.text('✅').removeClass('spinner-border spinner-border-sm text-warning').show();
+            } else {
+                statusCell.text('Snapshot failed ❌ (VM not found)').removeClass().addClass('text-danger');
+                bar.css('width','100%').removeClass().addClass('progress-bar bg-danger').attr('aria-valuenow',100);
+                icon.text('❌').removeClass('spinner-border spinner-border-sm text-warning').show();
+            }
+
             $('#snapshot_btn').prop("disabled", false).text("Start Snapshot");
-        } else {
-            console.warn("[DEBUG] Could not match host for complete event:", data.host);
         }
     });
 });
