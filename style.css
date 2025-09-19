@@ -1,0 +1,29 @@
+/* Minimal example, customize as needed */
+.epiq-btn {
+    font-weight: 500;
+}
+
+.text-epiq-primary {
+    color: #1a73e8;
+}
+
+.text-epiq-accent {
+    color: #ff5722;
+}
+
+.epiq-card {
+    border-radius: 0.5rem;
+    box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+}
+
+.epiq-input {
+    border-radius: 0.3rem;
+}
+
+.epiq-table {
+    font-size: 0.95rem;
+}
+
+.bg-epiq-progress {
+    background-color: #ffc107 !important;
+}
