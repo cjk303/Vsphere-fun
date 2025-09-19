@@ -1,0 +1,3 @@
+curl -X POST http://your-server:8080/webhook \
+     -H "Content-Type: application/json" \
+     -d '{"hosts": ["vm1","vm2"],"snapshot_name":"WebhookSnapshot","snapshot_desc":"Triggered via webhook"}'
