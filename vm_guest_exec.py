@@ -121,7 +121,7 @@ def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False):
 
     return None, None, None
 
-def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: str, program_path: str, args: str = ""):
+def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: str, command: str, args: str = ""):
     if vm.guest.toolsRunningStatus != 'guestToolsRunning':
         raise RuntimeError(f"VM {vm.summary.config.name} does not have VMware Tools running")
 
@@ -130,15 +130,15 @@ def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: s
     pm = gom.processManager
     fm = gom.fileManager
 
-    # Temp file
-    if "\\" in program_path:
+    # Temp file for stdout/stderr
+    if "\\" in command:
         temp_file = f"C:\\Windows\\Temp\\guest_out_{uuid.uuid4().hex}.txt"
         redirect_args = f"{args} > {temp_file} 2>&1"
     else:
         temp_file = f"/tmp/guest_out_{uuid.uuid4().hex}.txt"
         redirect_args = f"{args} > {temp_file} 2>&1"
 
-    spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath=program_path, arguments=redirect_args)
+    spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath=command, arguments=redirect_args)
     pid = pm.StartProgramInGuest(vm=vm, auth=creds, spec=spec)
     print(f"[INFO] Started process in VM {vm.summary.config.name}, PID={pid}")
     return pid, temp_file, gom
@@ -175,11 +175,11 @@ def delete_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_p
     except Exception as e:
         print(f"[WARN] Could not delete temp file {file_path}: {e}")
 
-def execute_guest_command(vcenters, target, guest_user, guest_pass, program_path, args="", cache=None, skip_cache=False, timeout=60):
+def execute_guest_command(vcenters, target, guest_user, guest_pass, command, args="", cache=None, skip_cache=False, timeout=60):
     vm, vc, si = find_vm_by_cache_or_live(vcenters, target, cache, skip_cache)
     if not vm:
         return False, f"VM {target} not found"
-    pid, temp_file, gom = run_command_in_vm(si, vm, guest_user, guest_pass, program_path, args)
+    pid, temp_file, gom = run_command_in_vm(si, vm, guest_user, guest_pass, command, args)
     success = wait_for_process(vm, pid, gom, guest_user, guest_pass, timeout)
     output = read_file_from_guest(vm, gom, guest_user, guest_pass, temp_file)
     delete_file_from_guest(vm, gom, guest_user, guest_pass, temp_file)
@@ -200,12 +200,11 @@ def main():
     parser.add_argument("--vm", required=True, help="VM name or IP")
     parser.add_argument("--guest-user", required=True, help="Guest OS username")
     parser.add_argument("--guest-pass", required=True, help="Guest OS password")
-    parser.add_argument("--program", required=True, help="Program path inside guest")
-    parser.add_argument("--args", default="", help="Program arguments")
+    parser.add_argument("--command", required=True, help="Command or program to run inside guest VM")
+    parser.add_argument("--args", default="", help="Command arguments")
     parser.add_argument("--timeout", type=int, default=60, help="Timeout in seconds")
     args = parser.parse_args()
 
-    # Reuse original vm_snapshot.py function
     from vm_snapshot import load_encrypted_credentials
     vcenters = load_encrypted_credentials(args.cred_file, args.key_file)
     cache = load_cache(args.cache_file, args.key_file)
@@ -220,7 +219,7 @@ def main():
         target=args.vm,
         guest_user=args.guest_user,
         guest_pass=args.guest_pass,
-        program_path=args.program,
+        command=args.command,
         args=args.args,
         cache=cache,
         skip_cache=args.skip_cache,
