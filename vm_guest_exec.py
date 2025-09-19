@@ -87,7 +87,7 @@ def connect_to_vcenter(host: str, user: str, password: str):
 
 def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False):
     """
-    Return (vm_object, vcenter_info)
+    Return (vm_object, vcenter_info, si)
     """
     target_lower = target.lower()
     for vc in vcenters:
@@ -101,7 +101,7 @@ def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False):
                     for vm in container_view.view:
                         if vm._moId == vm_data["mo_ref"]:
                             container_view.Destroy()
-                            return vm, vc
+                            return vm, vc, si
                     container_view.Destroy()
                     Disconnect(si)
 
@@ -113,20 +113,20 @@ def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False):
             for vm in container_view.view:
                 if vm.summary.config.name.lower() == target_lower:
                     container_view.Destroy()
-                    return vm, vc
+                    return vm, vc, si
             container_view.Destroy()
             Disconnect(si)
         except Exception:
             continue
 
-    return None, None
+    return None, None, None
 
-def run_command_in_vm(vm: vim.VirtualMachine, guest_user: str, guest_pass: str, program_path: str, args: str = ""):
+def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: str, program_path: str, args: str = ""):
     if vm.guest.toolsRunningStatus != 'guestToolsRunning':
         raise RuntimeError(f"VM {vm.summary.config.name} does not have VMware Tools running")
 
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
-    gom = vm._stub.content.guestOperationsManager
+    gom = si.content.guestOperationsManager
     pm = gom.processManager
     fm = gom.fileManager
 
@@ -141,11 +141,11 @@ def run_command_in_vm(vm: vim.VirtualMachine, guest_user: str, guest_pass: str, 
     spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath=program_path, arguments=redirect_args)
     pid = pm.StartProgramInGuest(vm=vm, auth=creds, spec=spec)
     print(f"[INFO] Started process in VM {vm.summary.config.name}, PID={pid}")
-    return pid, temp_file
+    return pid, temp_file, gom
 
-def wait_for_process(vm: vim.VirtualMachine, pid: int, guest_user: str, guest_pass: str, timeout=60):
+def wait_for_process(vm: vim.VirtualMachine, pid: int, gom, guest_user: str, guest_pass: str, timeout=60):
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
-    pm = vm._stub.content.guestOperationsManager.processManager
+    pm = gom.processManager
     start_time = time.time()
     while time.time() - start_time < timeout:
         processes = pm.ListProcessesInGuest(vm, creds, [pid])
@@ -154,9 +154,9 @@ def wait_for_process(vm: vim.VirtualMachine, pid: int, guest_user: str, guest_pa
         time.sleep(1)
     return False
 
-def read_file_from_guest(vm: vim.VirtualMachine, guest_user: str, guest_pass: str, file_path: str):
+def read_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_pass: str, file_path: str):
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
-    fm = vm._stub.content.guestOperationsManager.fileManager
+    fm = gom.fileManager
     try:
         file_info = fm.InitiateFileTransferFromGuest(vm, creds, file_path)
         response = requests.get(file_info.url, verify=False)
@@ -166,9 +166,9 @@ def read_file_from_guest(vm: vim.VirtualMachine, guest_user: str, guest_pass: st
     except Exception as e:
         return f"[ERROR] Exception reading file {file_path}: {e}"
 
-def delete_file_from_guest(vm: vim.VirtualMachine, guest_user: str, guest_pass: str, file_path: str):
+def delete_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_pass: str, file_path: str):
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
-    fm = vm._stub.content.guestOperationsManager.fileManager
+    fm = gom.fileManager
     try:
         fm.DeleteFileInGuest(vm, creds, file_path)
         print(f"[INFO] Deleted temp file {file_path}")
@@ -176,13 +176,14 @@ def delete_file_from_guest(vm: vim.VirtualMachine, guest_user: str, guest_pass: 
         print(f"[WARN] Could not delete temp file {file_path}: {e}")
 
 def execute_guest_command(vcenters, target, guest_user, guest_pass, program_path, args="", cache=None, skip_cache=False, timeout=60):
-    vm, vc = find_vm_by_cache_or_live(vcenters, target, cache, skip_cache)
+    vm, vc, si = find_vm_by_cache_or_live(vcenters, target, cache, skip_cache)
     if not vm:
         return False, f"VM {target} not found"
-    pid, temp_file = run_command_in_vm(vm, guest_user, guest_pass, program_path, args)
-    success = wait_for_process(vm, pid, guest_user, guest_pass, timeout)
-    output = read_file_from_guest(vm, guest_user, guest_pass, temp_file)
-    delete_file_from_guest(vm, guest_user, guest_pass, temp_file)
+    pid, temp_file, gom = run_command_in_vm(si, vm, guest_user, guest_pass, program_path, args)
+    success = wait_for_process(vm, pid, gom, guest_user, guest_pass, timeout)
+    output = read_file_from_guest(vm, gom, guest_user, guest_pass, temp_file)
+    delete_file_from_guest(vm, gom, guest_user, guest_pass, temp_file)
+    Disconnect(si)
     return success, output
 
 # ---------- CLI ----------
@@ -204,8 +205,8 @@ def main():
     parser.add_argument("--timeout", type=int, default=60, help="Timeout in seconds")
     args = parser.parse_args()
 
-    # Load credentials and cache
-    from vm_snapshot import load_encrypted_credentials  # reuse your original function
+    # Reuse original vm_snapshot.py function
+    from vm_snapshot import load_encrypted_credentials
     vcenters = load_encrypted_credentials(args.cred_file, args.key_file)
     cache = load_cache(args.cache_file, args.key_file)
 
