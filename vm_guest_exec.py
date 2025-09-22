@@ -60,17 +60,20 @@ def save_cache(cache: dict, cache_file: str, key_file: str):
     with open(cache_file, "wb") as f:
         f.write(encrypted)
 
-def build_full_cache(vcenters, cache=None, rate_limit=0.5):
+def build_full_cache(vcenters, cache=None, rate_limit=0.5, verbose=False):
     if cache is None:
         cache = {}
 
     if not cache_lock.acquire(blocking=False):
-        print("[INFO] Cache rebuild already running, using existing cache...")
+        if verbose:
+            print("[INFO] Cache rebuild already running, using existing cache...")
         return cache
 
     try:
         for vc in vcenters:
             try:
+                if verbose:
+                    print(f"[INFO] Connecting to vCenter {vc['host']} to build cache...")
                 si = SmartConnect(host=vc["host"], user=vc["user"], pwd=vc["password"], sslContext=ssl_context)
                 content = si.RetrieveContent()
                 container_view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
@@ -92,11 +95,15 @@ def build_full_cache(vcenters, cache=None, rate_limit=0.5):
                         for k in keys_to_cache:
                             cache_key = f"{vc['host']}::{k}"
                             cache[cache_key] = vm_data
+                        if verbose:
+                            print(f"[CACHE] Cached VM {name} on {vc['host']}")
                         time.sleep(rate_limit)
                     except Exception:
                         continue
                 container_view.Destroy()
                 Disconnect(si)
+                if verbose:
+                    print(f"[INFO] Finished caching vCenter {vc['host']}")
             except Exception as e:
                 print(f"[WARN] Failed to cache {vc['host']}: {e}")
     finally:
@@ -105,48 +112,69 @@ def build_full_cache(vcenters, cache=None, rate_limit=0.5):
     return cache
 
 # ---------- VM CONNECTION & GUEST COMMAND ----------
-def connect_to_vcenter(host: str, user: str, password: str):
+def connect_to_vcenter(host: str, user: str, password: str, verbose=False):
+    if verbose:
+        print(f"[INFO] Connecting to vCenter {host}...")
     si = SmartConnect(host=host, user=user, pwd=password, sslContext=ssl_context)
-    print(f"[INFO] Connected to vCenter {host}")
+    if verbose:
+        print(f"[INFO] Connected to {host}")
     return si
 
-def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False):
+def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False, verbose=False):
     """
-    Return (vm_object, vcenter_info, si)
+    Return (vm_object, vcenter_info, si) or (None, None, None)
     """
     target_lower = target.lower()
-    for vc in vcenters:
-        # check cache first
-        if cache and not skip_cache:
-            for key, vm_data in cache.items():
-                if vm_data["vcenter"] == vc["host"] and target_lower in [vm_data["name"].lower()] + [ip.lower() for ip in vm_data.get("ips", [])]:
-                    si = connect_to_vcenter(vc["host"], vc["user"], vc["password"])
-                    content = si.RetrieveContent()
-                    container_view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
-                    for vm in container_view.view:
-                        if vm._moId == vm_data["mo_ref"]:
-                            container_view.Destroy()
-                            return vm, vc, si
-                    container_view.Destroy()
-                    Disconnect(si)
 
-        # fallback: live search
+    for vc in vcenters:
+        si = None
         try:
-            si = connect_to_vcenter(vc["host"], vc["user"], vc["password"])
+            if verbose:
+                print(f"[INFO] Checking vCenter {vc['host']} for VM '{target}'")
+            # check cache first
+            if cache and not skip_cache:
+                for key, vm_data in cache.items():
+                    if vm_data["vcenter"] == vc["host"] and target_lower in [vm_data["name"].lower()] + [ip.lower() for ip in vm_data.get("ips", [])]:
+                        si = connect_to_vcenter(vc["host"], vc["user"], vc["password"], verbose)
+                        content = si.RetrieveContent()
+                        container_view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
+                        for vm in container_view.view:
+                            if vm._moId == vm_data["mo_ref"]:
+                                container_view.Destroy()
+                                if verbose:
+                                    print(f"[INFO] VM '{target}' found in cache on {vc['host']}")
+                                return vm, vc, si
+                        container_view.Destroy()
+                        Disconnect(si)
+                        si = None
+
+            # fallback: live search
+            si = connect_to_vcenter(vc["host"], vc["user"], vc["password"], verbose)
             content = si.RetrieveContent()
             container_view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
             for vm in container_view.view:
                 if vm.summary.config.name.lower() == target_lower:
                     container_view.Destroy()
+                    if verbose:
+                        print(f"[INFO] VM '{target}' found live on {vc['host']}")
                     return vm, vc, si
             container_view.Destroy()
             Disconnect(si)
-        except Exception:
+            si = None
+            if verbose:
+                print(f"[INFO] VM '{target}' not found on {vc['host']}")
+        except Exception as e:
+            if si:
+                Disconnect(si)
+            if verbose:
+                print(f"[WARN] Error checking vCenter {vc['host']}: {e}")
             continue
 
+    if verbose:
+        print(f"[INFO] VM '{target}' not found in any vCenter")
     return None, None, None
 
-def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: str, command: str, args: str = ""):
+def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: str, command: str, args: str = "", verbose=False):
     if vm.guest.toolsRunningStatus != 'guestToolsRunning':
         raise RuntimeError(f"VM {vm.summary.config.name} does not have VMware Tools running")
 
@@ -168,49 +196,58 @@ def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: s
 
     spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath=program_path, arguments=final_args)
     pid = pm.StartProgramInGuest(vm=vm, auth=creds, spec=spec)
-    print(f"[INFO] Started process in VM {vm.summary.config.name}, PID={pid}")
+    if verbose:
+        print(f"[INFO] Started process in VM {vm.summary.config.name}, PID={pid}")
     return pid, temp_file, gom, is_windows
 
-def wait_for_process(vm: vim.VirtualMachine, pid: int, gom, guest_user: str, guest_pass: str, timeout=60):
+def wait_for_process(vm: vim.VirtualMachine, pid: int, gom, guest_user: str, guest_pass: str, timeout=60, verbose=False):
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
     pm = gom.processManager
     start_time = time.time()
     while time.time() - start_time < timeout:
         processes = pm.ListProcessesInGuest(vm, creds, [pid])
         if not processes or processes[0].endTime:
+            if verbose:
+                print(f"[INFO] Process PID={pid} finished in VM {vm.summary.config.name}")
             return True
         time.sleep(1)
+    if verbose:
+        print(f"[WARN] Process PID={pid} timed out in VM {vm.summary.config.name}")
     return False
 
-def read_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_pass: str, file_path: str, is_windows: bool):
+def read_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_pass: str, file_path: str, is_windows: bool, verbose=False):
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
     fm = gom.fileManager
     try:
         file_info = fm.InitiateFileTransferFromGuest(vm, creds, file_path)
         response = requests.get(file_info.url, verify=False)
         if response.status_code == 200:
+            if verbose:
+                print(f"[INFO] Read output file {file_path} from VM {vm.summary.config.name}")
             return response.text
         return f"[ERROR] Could not read file {file_path}: HTTP {response.status_code}"
     except Exception as e:
         return f"[ERROR] Exception reading file {file_path}: {e}"
 
-def delete_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_pass: str, file_path: str):
+def delete_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_pass: str, file_path: str, verbose=False):
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
     fm = gom.fileManager
     try:
         fm.DeleteFileInGuest(vm, creds, file_path)
-        print(f"[INFO] Deleted temp file {file_path}")
+        if verbose:
+            print(f"[INFO] Deleted temp file {file_path} in VM {vm.summary.config.name}")
     except Exception as e:
-        print(f"[WARN] Could not delete temp file {file_path}: {e}")
+        if verbose:
+            print(f"[WARN] Could not delete temp file {file_path}: {e}")
 
-def execute_guest_command(vcenters, target, guest_user, guest_pass, command, args="", cache=None, skip_cache=False, timeout=60):
-    vm, vc, si = find_vm_by_cache_or_live(vcenters, target, cache, skip_cache)
+def execute_guest_command(vcenters, target, guest_user, guest_pass, command, args="", cache=None, skip_cache=False, timeout=60, verbose=False):
+    vm, vc, si = find_vm_by_cache_or_live(vcenters, target, cache, skip_cache, verbose)
     if not vm:
         return False, f"VM {target} not found"
-    pid, temp_file, gom, is_windows = run_command_in_vm(si, vm, guest_user, guest_pass, command, args)
-    success = wait_for_process(vm, pid, gom, guest_user, guest_pass, timeout)
-    output = read_file_from_guest(vm, gom, guest_user, guest_pass, temp_file, is_windows)
-    delete_file_from_guest(vm, gom, guest_user, guest_pass, temp_file)
+    pid, temp_file, gom, is_windows = run_command_in_vm(si, vm, guest_user, guest_pass, command, args, verbose)
+    success = wait_for_process(vm, pid, gom, guest_user, guest_pass, timeout, verbose)
+    output = read_file_from_guest(vm, gom, guest_user, guest_pass, temp_file, is_windows, verbose)
+    delete_file_from_guest(vm, gom, guest_user, guest_pass, temp_file, verbose)
     Disconnect(si)
     return success, output
 
@@ -231,15 +268,17 @@ def main():
     parser.add_argument("--command", required=True, help="Shell command to run inside guest VM")
     parser.add_argument("--args", default="", help="Optional command arguments")
     parser.add_argument("--timeout", type=int, default=60, help="Timeout in seconds")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     args = parser.parse_args()
 
     vcenters = load_encrypted_credentials(args.cred_file, args.key_file)
     cache = load_cache(args.cache_file, args.key_file)
 
     if args.refresh_cache:
-        cache = build_full_cache(vcenters, cache)
+        cache = build_full_cache(vcenters, cache, verbose=args.verbose)
         save_cache(cache, args.cache_file, args.key_file)
-        print("[INFO] Cache rebuilt successfully.")
+        if args.verbose:
+            print("[INFO] Cache rebuilt successfully.")
 
     success, output = execute_guest_command(
         vcenters=vcenters,
@@ -250,7 +289,8 @@ def main():
         args=args.args,
         cache=cache,
         skip_cache=args.skip_cache,
-        timeout=args.timeout
+        timeout=args.timeout,
+        verbose=args.verbose
     )
 
     if success:
