@@ -122,53 +122,57 @@ def connect_to_vcenter(host: str, user: str, password: str, verbose=False):
 
 def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False, verbose=False):
     """
-    Return (vm_object, vcenter_info, si) or (None, None, None)
+    Fast VM lookup: check cache first, then fallback to live search.
+    Returns (vm_object, vcenter_info, si) or (None, None, None)
     """
     target_lower = target.lower()
 
-    for vc in vcenters:
-        si = None
-        try:
-            if verbose:
-                print(f"[INFO] Checking vCenter {vc['host']} for VM '{target}'")
-            # check cache first
-            if cache and not skip_cache:
-                for key, vm_data in cache.items():
-                    if vm_data["vcenter"] == vc["host"] and target_lower in [vm_data["name"].lower()] + [ip.lower() for ip in vm_data.get("ips", [])]:
-                        si = connect_to_vcenter(vc["host"], vc["user"], vc["password"], verbose)
-                        content = si.RetrieveContent()
-                        container_view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
-                        for vm in container_view.view:
-                            if vm._moId == vm_data["mo_ref"]:
-                                container_view.Destroy()
-                                if verbose:
-                                    print(f"[INFO] VM '{target}' found in cache on {vc['host']}")
-                                return vm, vc, si
-                        container_view.Destroy()
-                        Disconnect(si)
-                        si = None
-
-            # fallback: live search
-            si = connect_to_vcenter(vc["host"], vc["user"], vc["password"], verbose)
-            content = si.RetrieveContent()
-            container_view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
-            for vm in container_view.view:
-                if vm.summary.config.name.lower() == target_lower:
+    # --- 1. Try cache first ---
+    if cache and not skip_cache:
+        for cache_key, vm_data in cache.items():
+            if target_lower in [vm_data["name"].lower()] + [ip.lower() for ip in vm_data.get("ips", [])]:
+                if verbose:
+                    print(f"[INFO] Found VM '{target}' in cache for vCenter {vm_data['vcenter']}")
+                # Connect to the correct vCenter
+                vc = next((vc for vc in vcenters if vc["host"] == vm_data["vcenter"]), None)
+                if vc is None:
+                    continue
+                try:
+                    si = connect_to_vcenter(vc["host"], vc["user"], vc["password"], verbose)
+                    content = si.RetrieveContent()
+                    container_view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
+                    for vm in container_view.view:
+                        if vm._moId == vm_data["mo_ref"]:
+                            container_view.Destroy()
+                            return vm, vc, si
                     container_view.Destroy()
+                    Disconnect(si)
+                except Exception as e:
                     if verbose:
-                        print(f"[INFO] VM '{target}' found live on {vc['host']}")
-                    return vm, vc, si
-            container_view.Destroy()
-            Disconnect(si)
-            si = None
-            if verbose:
-                print(f"[INFO] VM '{target}' not found on {vc['host']}")
-        except Exception as e:
-            if si:
+                        print(f"[WARN] Error connecting to vCenter {vc['host']}: {e}")
+                    continue
+
+    # --- 2. Fallback to live search ---
+    for vc in vcenters:
+        if skip_cache:  # Only attempt live search
+            try:
+                if verbose:
+                    print(f"[INFO] Performing live search in vCenter {vc['host']} for VM '{target}'...")
+                si = connect_to_vcenter(vc["host"], vc["user"], vc["password"], verbose)
+                content = si.RetrieveContent()
+                container_view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
+                for vm in container_view.view:
+                    if vm.summary.config.name.lower() == target_lower:
+                        container_view.Destroy()
+                        if verbose:
+                            print(f"[INFO] Found VM '{target}' live on {vc['host']}")
+                        return vm, vc, si
+                container_view.Destroy()
                 Disconnect(si)
-            if verbose:
-                print(f"[WARN] Error checking vCenter {vc['host']}: {e}")
-            continue
+            except Exception as e:
+                if verbose:
+                    print(f"[WARN] Error searching vCenter {vc['host']}: {e}")
+                continue
 
     if verbose:
         print(f"[INFO] VM '{target}' not found in any vCenter")
@@ -261,7 +265,7 @@ def main():
     parser.add_argument("--key-file", default="vm_key.key", help="Key for encrypted credentials and cache")
     parser.add_argument("--cache-file", default="vm_cache.enc", help="Encrypted VM cache file")
     parser.add_argument("--refresh-cache", action="store_true", help="Rebuild global VM cache")
-    parser.add_argument("--skip-cache", action="store_true", help="Do not use existing cache")
+    parser.add_argument("--skip-cache", action="store_true", help="Do not use existing cache, force live search")
     parser.add_argument("--vm", required=True, help="VM name or IP")
     parser.add_argument("--guest-user", required=True, help="Guest OS username")
     parser.add_argument("--guest-pass", required=True, help="Guest OS password")
