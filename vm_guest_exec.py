@@ -9,9 +9,54 @@ from cryptography.fernet import Fernet
 from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim
 import threading
+import getpass
 
 ssl_context = ssl._create_unverified_context()
 cache_lock = threading.Lock()  # prevent simultaneous cache rebuilds
+
+# ---------- CREDENTIAL MANAGEMENT ----------
+def save_encrypted_credentials(vcenters: list, cred_file: str, key_file: str):
+    if not os.path.exists(key_file):
+        with open(key_file, "wb") as f:
+            f.write(Fernet.generate_key())
+    with open(key_file, "rb") as f:
+        key = f.read()
+    fernet = Fernet(key)
+    encrypted = fernet.encrypt(json.dumps(vcenters).encode())
+    with open(cred_file, "wb") as f:
+        f.write(encrypted)
+
+
+def load_encrypted_credentials(cred_file: str, key_file: str) -> list:
+    if not os.path.exists(cred_file) or not os.path.exists(key_file):
+        raise FileNotFoundError("Credential or key file missing")
+
+    with open(key_file, "rb") as f:
+        key = f.read()
+    fernet = Fernet(key)
+
+    with open(cred_file, "rb") as f:
+        encrypted = f.read()
+    decrypted = fernet.decrypt(encrypted)
+    return json.loads(decrypted)  # [{"host":..., "user":..., "password":...}, ...]
+
+
+def init_credentials(cred_file: str, key_file: str):
+    vcenters = []
+    print("Initialize vCenter credentials (leave host empty to finish):")
+    while True:
+        host = input("vCenter host (or blank to finish): ").strip()
+        if not host:
+            break
+        user = input(f"Username for {host}: ").strip()
+        password = getpass.getpass(f"Password for {host}: ")
+        vcenters.append({"host": host, "user": user, "password": password})
+
+    if vcenters:
+        save_encrypted_credentials(vcenters, cred_file, key_file)
+        print(f"[INFO] Credentials saved to {cred_file} (key in {key_file})")
+    else:
+        print("[INFO] No credentials entered, skipping save.")
 
 # ---------- CACHE FUNCTIONS ----------
 def load_cache(cache_file: str, key_file: str) -> dict:
@@ -27,13 +72,18 @@ def load_cache(cache_file: str, key_file: str) -> dict:
     except Exception:
         return {}
 
+
 def save_cache(cache: dict, cache_file: str, key_file: str):
+    if not os.path.exists(key_file):
+        with open(key_file, "wb") as f:
+            f.write(Fernet.generate_key())
     with open(key_file, "rb") as f:
         key = f.read()
     fernet = Fernet(key)
     encrypted = fernet.encrypt(json.dumps(cache).encode())
     with open(cache_file, "wb") as f:
         f.write(encrypted)
+
 
 def build_full_cache(vcenters, cache=None, rate_limit=0.5):
     if cache is None:
@@ -68,7 +118,8 @@ def build_full_cache(vcenters, cache=None, rate_limit=0.5):
                             cache_key = f"{vc['host']}::{k}"
                             cache[cache_key] = vm_data
                         time.sleep(rate_limit)
-                    except Exception:
+                    except Exception as e:
+                        print(f"[WARN] Failed processing VM: {e}")
                         continue
                 container_view.Destroy()
                 Disconnect(si)
@@ -84,6 +135,7 @@ def connect_to_vcenter(host: str, user: str, password: str):
     si = SmartConnect(host=host, user=user, pwd=password, sslContext=ssl_context)
     print(f"[INFO] Connected to vCenter {host}")
     return si
+
 
 def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False):
     """
@@ -121,6 +173,7 @@ def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False):
 
     return None, None, None
 
+
 def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: str, command: str, args: str = ""):
     if vm.guest.toolsRunningStatus != 'guestToolsRunning':
         raise RuntimeError(f"VM {vm.summary.config.name} does not have VMware Tools running")
@@ -129,11 +182,8 @@ def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: s
     gom = si.content.guestOperationsManager
     pm = gom.processManager
 
-    # Determine guest OS and wrap command
     guest_os = vm.summary.config.guestFullName.lower()
     is_windows = "windows" in guest_os
-
-    # Generate temp file BEFORE creating command
     temp_file = f"/tmp/guest_out_{uuid.uuid4().hex}.txt" if not is_windows else f"C:\\Windows\\Temp\\guest_out_{uuid.uuid4().hex}.txt"
 
     if is_windows:
@@ -148,6 +198,7 @@ def run_command_in_vm(si, vm: vim.VirtualMachine, guest_user: str, guest_pass: s
     print(f"[INFO] Started process in VM {vm.summary.config.name}, PID={pid}")
     return pid, temp_file, gom, is_windows
 
+
 def wait_for_process(vm: vim.VirtualMachine, pid: int, gom, guest_user: str, guest_pass: str, timeout=60):
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
     pm = gom.processManager
@@ -158,6 +209,7 @@ def wait_for_process(vm: vim.VirtualMachine, pid: int, gom, guest_user: str, gue
             return True
         time.sleep(1)
     return False
+
 
 def read_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_pass: str, file_path: str, is_windows: bool):
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
@@ -171,6 +223,7 @@ def read_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_pas
     except Exception as e:
         return f"[ERROR] Exception reading file {file_path}: {e}"
 
+
 def delete_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_pass: str, file_path: str):
     creds = vim.vm.guest.NamePasswordAuthentication(username=guest_user, password=guest_pass)
     fm = gom.fileManager
@@ -179,6 +232,7 @@ def delete_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_p
         print(f"[INFO] Deleted temp file {file_path}")
     except Exception as e:
         print(f"[WARN] Could not delete temp file {file_path}: {e}")
+
 
 def execute_guest_command(vcenters, target, guest_user, guest_pass, command, args="", cache=None, skip_cache=False, timeout=60):
     vm, vc, si = find_vm_by_cache_or_live(vcenters, target, cache, skip_cache)
@@ -200,23 +254,31 @@ def main():
     parser.add_argument("--cred-file", default="vm_cred.enc", help="Encrypted vCenter credentials file")
     parser.add_argument("--key-file", default="vm_key.key", help="Key for encrypted credentials and cache")
     parser.add_argument("--cache-file", default="vm_cache.enc", help="Encrypted VM cache file")
+    parser.add_argument("--init-creds", action="store_true", help="Initialize or update vCenter credentials")
     parser.add_argument("--refresh-cache", action="store_true", help="Rebuild global VM cache")
     parser.add_argument("--skip-cache", action="store_true", help="Do not use existing cache")
-    parser.add_argument("--vm", required=True, help="VM name or IP")
-    parser.add_argument("--guest-user", required=True, help="Guest OS username")
-    parser.add_argument("--guest-pass", required=True, help="Guest OS password")
-    parser.add_argument("--command", required=True, help="Shell command to run inside guest VM")
+    parser.add_argument("--vm", help="VM name or IP")
+    parser.add_argument("--guest-user", help="Guest OS username")
+    parser.add_argument("--guest-pass", help="Guest OS password")
+    parser.add_argument("--command", help="Shell command to run inside guest VM")
     parser.add_argument("--args", default="", help="Optional command arguments")
     parser.add_argument("--timeout", type=int, default=60, help="Timeout in seconds")
     args = parser.parse_args()
 
-    from vm_snapshot import load_encrypted_credentials
+    if args.init_creds:
+        init_credentials(args.cred_file, args.key_file)
+        return
+
+    if not args.vm or not args.guest_user or not args.guest_pass or not args.command:
+        parser.error("--vm, --guest-user, --guest-pass, and --command are required unless --init-creds is used")
+
     vcenters = load_encrypted_credentials(args.cred_file, args.key_file)
     cache = load_cache(args.cache_file, args.key_file)
 
     if args.refresh_cache:
-        cache = build_full_cache(vcenters, cache)
-        save_cache(cache, args.cache_file, args.key_file)
+        with cache_lock:
+            cache = build_full_cache(vcenters, cache)
+            save_cache(cache, args.cache_file, args.key_file)
         print("[INFO] Cache rebuilt successfully.")
 
     success, output = execute_guest_command(
@@ -238,6 +300,7 @@ def main():
 
     if output:
         print(f"[OUTPUT]\n{output}")
+
 
 if __name__ == "__main__":
     main()
