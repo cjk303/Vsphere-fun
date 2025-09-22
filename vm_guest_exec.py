@@ -121,22 +121,19 @@ def connect_to_vcenter(host: str, user: str, password: str, verbose=False):
     return si
 
 def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False, verbose=False):
-    """
-    Fast VM lookup: check cache first, then fallback to live search.
-    Returns (vm_object, vcenter_info, si) or (None, None, None)
-    """
     target_lower = target.lower()
 
     # --- 1. Try cache first ---
     if cache and not skip_cache:
         for cache_key, vm_data in cache.items():
-            if target_lower in [vm_data["name"].lower()] + [ip.lower() for ip in vm_data.get("ips", [])]:
-                if verbose:
-                    print(f"[INFO] Found VM '{target}' in cache for vCenter {vm_data['vcenter']}")
-                # Connect to the correct vCenter
-                vc = next((vc for vc in vcenters if vc["host"] == vm_data["vcenter"]), None)
+            match_targets = [vm_data["name"].lower()] + [ip.lower() for ip in vm_data.get("ips", [])]
+            if target_lower in match_targets:
+                # Find vcenter object by host, case-insensitive
+                vc = next((v for v in vcenters if v["host"].lower() == vm_data["vcenter"].lower()), None)
                 if vc is None:
-                    continue
+                    if verbose:
+                        print(f"[WARN] VM '{target}' found in cache but vCenter '{vm_data['vcenter']}' not in current vcenters list")
+                    continue  # try next cache entry
                 try:
                     si = connect_to_vcenter(vc["host"], vc["user"], vc["password"], verbose)
                     content = si.RetrieveContent()
@@ -144,17 +141,19 @@ def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False, ver
                     for vm in container_view.view:
                         if vm._moId == vm_data["mo_ref"]:
                             container_view.Destroy()
+                            if verbose:
+                                print(f"[INFO] Found VM '{target}' in cache on vCenter '{vc['host']}'")
                             return vm, vc, si
                     container_view.Destroy()
                     Disconnect(si)
                 except Exception as e:
                     if verbose:
                         print(f"[WARN] Error connecting to vCenter {vc['host']}: {e}")
-                    continue
+                    continue  # try next cache entry
 
     # --- 2. Fallback to live search ---
     for vc in vcenters:
-        if skip_cache:  # Only attempt live search
+        if skip_cache or (not cache) or verbose:
             try:
                 if verbose:
                     print(f"[INFO] Performing live search in vCenter {vc['host']} for VM '{target}'...")
@@ -239,7 +238,7 @@ def delete_file_from_guest(vm: vim.VirtualMachine, gom, guest_user: str, guest_p
     try:
         fm.DeleteFileInGuest(vm, creds, file_path)
         if verbose:
-            print(f"[INFO] Deleted temp file {file_path} in VM {vm.summary.config.name}")
+            print(f"[INFO] Deleted temp file {file_path}")
     except Exception as e:
         if verbose:
             print(f"[WARN] Could not delete temp file {file_path}: {e}")
@@ -261,20 +260,21 @@ def main():
         description="Execute shell commands in VMs using VMware Tools with cache support",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("--cred-file", default="vm_cred.enc", help="Encrypted vCenter credentials file")
-    parser.add_argument("--key-file", default="vm_key.key", help="Key for encrypted credentials and cache")
-    parser.add_argument("--cache-file", default="vm_cache.enc", help="Encrypted VM cache file")
-    parser.add_argument("--refresh-cache", action="store_true", help="Rebuild global VM cache")
-    parser.add_argument("--skip-cache", action="store_true", help="Do not use existing cache, force live search")
-    parser.add_argument("--vm", required=True, help="VM name or IP")
-    parser.add_argument("--guest-user", required=True, help="Guest OS username")
-    parser.add_argument("--guest-pass", required=True, help="Guest OS password")
-    parser.add_argument("--command", required=True, help="Shell command to run inside guest VM")
-    parser.add_argument("--args", default="", help="Optional command arguments")
-    parser.add_argument("--timeout", type=int, default=60, help="Timeout in seconds")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--cred-file", default="vm_cred.enc")
+    parser.add_argument("--key-file", default="vm_key.key")
+    parser.add_argument("--cache-file", default="vm_cache.enc")
+    parser.add_argument("--refresh-cache", action="store_true")
+    parser.add_argument("--skip-cache", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--vm", required=True)
+    parser.add_argument("--guest-user", required=True)
+    parser.add_argument("--guest-pass", required=True)
+    parser.add_argument("--command", required=True)
+    parser.add_argument("--args", default="")
+    parser.add_argument("--timeout", type=int, default=60)
     args = parser.parse_args()
 
+    from vm_snapshot import load_encrypted_credentials  # reuse working function
     vcenters = load_encrypted_credentials(args.cred_file, args.key_file)
     cache = load_cache(args.cache_file, args.key_file)
 
