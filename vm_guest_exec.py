@@ -133,7 +133,7 @@ def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False, ver
                 if vc is None:
                     if verbose:
                         print(f"[WARN] VM '{target}' found in cache but vCenter '{vm_data['vcenter']}' not in current vcenters list")
-                    continue  # try next cache entry
+                    continue
                 try:
                     si = connect_to_vcenter(vc["host"], vc["user"], vc["password"], verbose)
                     content = si.RetrieveContent()
@@ -149,7 +149,7 @@ def find_vm_by_cache_or_live(vcenters, target, cache=None, skip_cache=False, ver
                 except Exception as e:
                     if verbose:
                         print(f"[WARN] Error connecting to vCenter {vc['host']}: {e}")
-                    continue  # try next cache entry
+                    continue
 
     # --- 2. Fallback to live search ---
     for vc in vcenters:
@@ -274,7 +274,6 @@ def main():
     parser.add_argument("--timeout", type=int, default=60)
     args = parser.parse_args()
 
-    from vm_snapshot import load_encrypted_credentials  # reuse working function
     vcenters = load_encrypted_credentials(args.cred_file, args.key_file)
     cache = load_cache(args.cache_file, args.key_file)
 
